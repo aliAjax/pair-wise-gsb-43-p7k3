@@ -44,6 +44,26 @@ def clean_actor(actor: str) -> str:
     return actor
 
 
+def parse_money(value: Any, field: str = "金额") -> Decimal:
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError) as exc:
+        raise DomainError("%s必须是有效数值" % field) from exc
+    if amount <= 0:
+        raise DomainError("%s必须大于0" % field)
+    return amount
+
+
+def parse_quantity(value: Any) -> Decimal:
+    try:
+        quantity = Decimal(str(value)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError) as exc:
+        raise DomainError("完成量必须是有效数值") from exc
+    if quantity <= 0 or quantity > 100:
+        raise DomainError("完成量必须是0到100之间的完成比例")
+    return quantity
+
+
 def require_role(role: str, allowed: set[str], action: str) -> None:
     if role not in allowed:
         raise DomainError("角色无权执行：%s" % action, 403)
@@ -162,8 +182,81 @@ class ProcurementService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS contracts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_no TEXT NOT NULL UNIQUE,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    title TEXT NOT NULL,
+                    total_amount REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(tender_id)
+                );
+                CREATE TABLE IF NOT EXISTS contract_milestones (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id),
+                    seq INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    reported_quantity REAL,
+                    reported_by TEXT,
+                    reported_at TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(contract_id,seq)
+                );
+                CREATE TABLE IF NOT EXISTS acceptances (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id),
+                    milestone_id INTEGER NOT NULL REFERENCES contract_milestones(id),
+                    reported_quantity REAL NOT NULL,
+                    expected_amount REAL NOT NULL,
+                    accepted_amount REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'effective',
+                    note TEXT NOT NULL DEFAULT '',
+                    reported_by TEXT NOT NULL,
+                    accepted_by TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id),
+                    milestone_id INTEGER NOT NULL REFERENCES contract_milestones(id),
+                    amount REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'effective',
+                    note TEXT NOT NULL DEFAULT '',
+                    registered_by TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS contract_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id),
+                    version INTEGER NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(contract_id,version)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_acceptances_active
+                    ON acceptances(milestone_id) WHERE status IN ('effective','pending_review');
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_milestones_contract ON contract_milestones(contract_id,seq);
+                CREATE INDEX IF NOT EXISTS idx_acceptances_contract ON acceptances(contract_id,milestone_id);
+                CREATE INDEX IF NOT EXISTS idx_payments_contract ON payments(contract_id,milestone_id);
                 """
             )
 
@@ -179,6 +272,62 @@ class ProcurementService:
         if not row:
             raise DomainError("采购项目不存在", 404)
         return row
+
+    def _contract(self, conn: sqlite3.Connection, contract_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM contracts WHERE id=?", (contract_id,)).fetchone()
+        if not row:
+            raise DomainError("合同不存在", 404)
+        return row
+
+    def _milestone(self, conn: sqlite3.Connection, milestone_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM contract_milestones WHERE id=?", (milestone_id,)).fetchone()
+        if not row:
+            raise DomainError("合同节点不存在", 404)
+        return row
+
+    def _sum_amounts(self, conn: sqlite3.Connection, table: str, column: str,
+                     where: str, params: tuple) -> Decimal:
+        total = Decimal("0")
+        for row in conn.execute("SELECT %s AS v FROM %s WHERE %s" % (column, table, where), params).fetchall():
+            total += Decimal(str(row["v"]))
+        return total.quantize(Decimal("0.01"))
+
+    def _touch_contract(self, conn: sqlite3.Connection, contract_id: int, now: str) -> None:
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS c FROM contract_milestones WHERE contract_id=? AND status<>'paid'", (contract_id,)
+        ).fetchone()["c"]
+        status = "completed" if remaining == 0 else "active"
+        conn.execute("UPDATE contracts SET status=?,version=version+1,updated_at=? WHERE id=?", (status, now, contract_id))
+
+    def _refresh_milestone_paid(self, conn: sqlite3.Connection, milestone_id: int, now: str) -> None:
+        milestone = self._milestone(conn, milestone_id)
+        if milestone["status"] != "accepted":
+            return
+        accepted = self._sum_amounts(conn, "acceptances", "accepted_amount", "milestone_id=? AND status='effective'", (milestone_id,))
+        paid = self._sum_amounts(conn, "payments", "amount", "milestone_id=? AND status='effective'", (milestone_id,))
+        if accepted > 0 and paid >= accepted:
+            conn.execute("UPDATE contract_milestones SET status='paid',version=version+1,updated_at=? WHERE id=?", (now, milestone_id))
+
+    def _snapshot_contract(self, conn: sqlite3.Connection, contract_id: int, actor: str, reason: str) -> None:
+        contract = dict(self._contract(conn, contract_id))
+        snapshot = {
+            "contract": contract,
+            "milestones": [dict(r) for r in conn.execute(
+                "SELECT * FROM contract_milestones WHERE contract_id=? ORDER BY seq", (contract_id,)).fetchall()],
+            "acceptances": [dict(r) for r in conn.execute(
+                "SELECT * FROM acceptances WHERE contract_id=? ORDER BY id", (contract_id,)).fetchall()],
+            "payments": [dict(r) for r in conn.execute(
+                "SELECT * FROM payments WHERE contract_id=? ORDER BY id", (contract_id,)).fetchall()],
+        }
+        conn.execute(
+            "INSERT INTO contract_versions(contract_id,version,snapshot,reason,created_by,created_at) VALUES(?,?,?,?,?,?)",
+            (contract_id, contract["version"], json.dumps(snapshot, ensure_ascii=False, sort_keys=True), reason, actor, utcnow()),
+        )
+
+    def _is_contract_vendor(self, conn: sqlite3.Connection, contract: dict[str, Any], actor: str) -> bool:
+        tender = self._tender(conn, contract["tender_id"])
+        row = conn.execute("SELECT submitted_by FROM bids WHERE id=?", (tender["awarded_bid_id"],)).fetchone()
+        return bool(row) and row["submitted_by"] == actor
 
     def create_vendor(self, actor: str, role: str, vendor_no: str, name: str,
                       representative: str) -> dict[str, Any]:
@@ -556,6 +705,321 @@ class ProcurementService:
             self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
             return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
 
+    def create_contract(self, actor: str, role: str, tender_id: int, contract_no: str, title: str,
+                        milestones: list[dict[str, Any]], total_amount: Any = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "创建合同")
+        if not str(contract_no or "").strip() or not str(title or "").strip():
+            raise DomainError("合同编号和标题不能为空")
+        if not isinstance(milestones, list) or not milestones:
+            raise DomainError("合同至少需要一个履约节点")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] != "awarded":
+                raise DomainError("只有已授标项目可以建合同", 409)
+            if conn.execute("SELECT 1 FROM contracts WHERE tender_id=?", (tender_id,)).fetchone():
+                raise DomainError("该项目已建立合同", 409)
+            bid = conn.execute("SELECT * FROM bids WHERE id=?", (tender["awarded_bid_id"],)).fetchone()
+            if not bid:
+                raise DomainError("授标记录不存在", 409)
+            total = parse_money(bid["price"] if total_amount is None else total_amount, "合同额")
+            normalized = []
+            split_total = Decimal("0")
+            for seq, item in enumerate(milestones, 1):
+                if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+                    raise DomainError("节点格式无效")
+                amount = parse_money(item.get("amount"), "节点金额")
+                split_total += amount
+                normalized.append({"seq": seq, "name": str(item["name"]).strip(), "amount": amount})
+            if split_total != total:
+                raise DomainError("节点金额合计必须等于合同额")
+            now = utcnow()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO contracts(contract_no,tender_id,vendor_id,title,total_amount,created_by,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (contract_no.strip(), tender_id, bid["vendor_id"], title.strip(), float(total), actor, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("合同编号已存在", 409) from exc
+            contract_id = cur.lastrowid
+            for milestone in normalized:
+                conn.execute(
+                    "INSERT INTO contract_milestones(contract_id,seq,name,amount,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (contract_id, milestone["seq"], milestone["name"], float(milestone["amount"]), now, now),
+                )
+            self._audit(conn, tender_id, actor, "contract.created",
+                        {"contract_id": contract_id, "contract_no": contract_no.strip(),
+                         "total_amount": float(total), "milestones": len(normalized)})
+            self._snapshot_contract(conn, contract_id, actor, "contract.created")
+            contract = dict(self._contract(conn, contract_id))
+            return self._performance_view(conn, contract, actor, role)
+
+    def report_progress(self, actor: str, role: str, milestone_id: int, quantity: Any) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor"}, "填报完成量")
+        qty = parse_quantity(quantity)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            milestone = self._milestone(conn, milestone_id)
+            contract = self._contract(conn, milestone["contract_id"])
+            if contract["status"] != "active":
+                raise DomainError("合同不在履约中", 409)
+            if not self._is_contract_vendor(conn, dict(contract), actor):
+                raise DomainError("只能填报自己中标的合同", 403)
+            if milestone["status"] != "pending":
+                raise DomainError("该节点已报量，不能重复提交", 409)
+            now = utcnow()
+            conn.execute(
+                """UPDATE contract_milestones
+                   SET status='reported',reported_quantity=?,reported_by=?,reported_at=?,version=version+1,updated_at=?
+                   WHERE id=?""",
+                (float(qty), actor, now, now, milestone_id),
+            )
+            self._touch_contract(conn, contract["id"], now)
+            self._audit(conn, contract["tender_id"], actor, "milestone.reported",
+                        {"milestone_id": milestone_id, "quantity": float(qty)})
+            self._snapshot_contract(conn, contract["id"], actor, "milestone.reported")
+            return dict(conn.execute("SELECT * FROM contract_milestones WHERE id=?", (milestone_id,)).fetchone())
+
+    def accept_progress(self, actor: str, role: str, milestone_id: int, accepted_amount: Any,
+                        note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"procurement"}, "验收")
+        accepted = parse_money(accepted_amount, "验收金额")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            milestone = self._milestone(conn, milestone_id)
+            contract = self._contract(conn, milestone["contract_id"])
+            if contract["status"] != "active":
+                raise DomainError("合同不在履约中", 409)
+            if milestone["status"] != "reported":
+                raise DomainError("供应商尚未报量或节点已验收", 409)
+            if conn.execute(
+                "SELECT 1 FROM acceptances WHERE milestone_id=? AND status IN ('effective','pending_review')", (milestone_id,)
+            ).fetchone():
+                raise DomainError("该节点已存在验收记录，不能重复提交", 409)
+            planned = Decimal(str(milestone["amount"]))
+            qty = Decimal(str(milestone["reported_quantity"]))
+            expected = (planned * qty / Decimal("100")).quantize(Decimal("0.01"))
+            contract_accepted = self._sum_amounts(
+                conn, "acceptances", "accepted_amount", "contract_id=? AND status='effective'", (contract["id"],))
+            reasons = []
+            if accepted != expected:
+                reasons.append("金额不匹配")
+            if accepted > planned:
+                reasons.append("超出节点金额")
+            if contract_accepted + accepted > Decimal(str(contract["total_amount"])):
+                reasons.append("累计验收超出合同额")
+            status = "pending_review" if reasons else "effective"
+            now = utcnow()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO acceptances(contract_id,milestone_id,reported_quantity,expected_amount,accepted_amount,
+                                               status,note,reported_by,accepted_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (contract["id"], milestone_id, float(qty), float(expected), float(accepted),
+                     status, note.strip(), milestone["reported_by"], actor, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该节点已存在验收记录，不能重复提交", 409) from exc
+            if status == "effective":
+                conn.execute(
+                    "UPDATE contract_milestones SET status='accepted',version=version+1,updated_at=? WHERE id=?",
+                    (now, milestone_id),
+                )
+            self._touch_contract(conn, contract["id"], now)
+            self._audit(conn, contract["tender_id"], actor, "milestone.accepted",
+                        {"acceptance_id": cur.lastrowid, "milestone_id": milestone_id, "status": status, "reasons": reasons})
+            self._snapshot_contract(conn, contract["id"], actor, "milestone.accepted")
+            return dict(conn.execute("SELECT * FROM acceptances WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def register_payment(self, actor: str, role: str, milestone_id: int, amount: Any,
+                         note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "登记付款")
+        payment = parse_money(amount, "付款金额")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            milestone = self._milestone(conn, milestone_id)
+            contract = self._contract(conn, milestone["contract_id"])
+            if contract["status"] != "active":
+                raise DomainError("合同不在履约中", 409)
+            accepted = self._sum_amounts(
+                conn, "acceptances", "accepted_amount", "milestone_id=? AND status='effective'", (milestone_id,))
+            paid = self._sum_amounts(conn, "payments", "amount", "milestone_id=? AND status='effective'", (milestone_id,))
+            contract_paid = self._sum_amounts(conn, "payments", "amount", "contract_id=? AND status='effective'", (contract["id"],))
+            reasons = []
+            if paid + payment > accepted:
+                reasons.append("节点超付")
+            if contract_paid + payment > Decimal(str(contract["total_amount"])):
+                reasons.append("累计付款超出合同额")
+            status = "pending_review" if reasons else "effective"
+            now = utcnow()
+            cur = conn.execute(
+                "INSERT INTO payments(contract_id,milestone_id,amount,status,note,registered_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                (contract["id"], milestone_id, float(payment), status, note.strip(), actor, now),
+            )
+            if status == "effective":
+                self._refresh_milestone_paid(conn, milestone_id, now)
+            self._touch_contract(conn, contract["id"], now)
+            self._audit(conn, contract["tender_id"], actor, "payment.registered",
+                        {"payment_id": cur.lastrowid, "milestone_id": milestone_id, "status": status, "reasons": reasons})
+            self._snapshot_contract(conn, contract["id"], actor, "payment.registered")
+            return dict(conn.execute("SELECT * FROM payments WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def review_record(self, actor: str, role: str, kind: str, record_id: int, decision: str,
+                      note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "复核")
+        if kind not in {"acceptance", "payment"}:
+            raise DomainError("复核类型只支持 acceptance 或 payment")
+        if decision not in {"confirm", "void"}:
+            raise DomainError("复核决定只支持 confirm 或 void")
+        table = "acceptances" if kind == "acceptance" else "payments"
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record = conn.execute("SELECT * FROM %s WHERE id=?" % table, (record_id,)).fetchone()
+            if not record:
+                raise DomainError("复核记录不存在", 404)
+            if record["status"] != "pending_review":
+                raise DomainError("该记录不在待复核状态", 409)
+            contract = self._contract(conn, record["contract_id"])
+            milestone = self._milestone(conn, record["milestone_id"])
+            now = utcnow()
+            if decision == "confirm":
+                if kind == "acceptance":
+                    accepted = Decimal(str(record["accepted_amount"]))
+                    others = self._sum_amounts(
+                        conn, "acceptances", "accepted_amount", "contract_id=? AND status='effective'", (contract["id"],))
+                    if accepted > Decimal(str(milestone["amount"])) or \
+                            others + accepted > Decimal(str(contract["total_amount"])):
+                        raise DomainError("仍超出合同额，不能确认为有效", 409)
+                    conn.execute(
+                        "UPDATE acceptances SET status='effective',reviewed_by=?,reviewed_at=?,version=version+1 WHERE id=?",
+                        (actor, now, record_id),
+                    )
+                    conn.execute(
+                        "UPDATE contract_milestones SET status='accepted',version=version+1,updated_at=? WHERE id=?",
+                        (now, milestone["id"]),
+                    )
+                else:
+                    amount = Decimal(str(record["amount"]))
+                    accepted = self._sum_amounts(
+                        conn, "acceptances", "accepted_amount", "milestone_id=? AND status='effective'", (milestone["id"],))
+                    paid = self._sum_amounts(
+                        conn, "payments", "amount", "milestone_id=? AND status='effective'", (milestone["id"],))
+                    contract_paid = self._sum_amounts(
+                        conn, "payments", "amount", "contract_id=? AND status='effective'", (contract["id"],))
+                    if paid + amount > accepted or contract_paid + amount > Decimal(str(contract["total_amount"])):
+                        raise DomainError("仍超出可付额度，不能确认为有效", 409)
+                    conn.execute(
+                        "UPDATE payments SET status='effective',reviewed_by=?,reviewed_at=?,version=version+1 WHERE id=?",
+                        (actor, now, record_id),
+                    )
+                    self._refresh_milestone_paid(conn, milestone["id"], now)
+            else:
+                conn.execute(
+                    "UPDATE %s SET status='void',reviewed_by=?,reviewed_at=?,version=version+1 WHERE id=?" % table,
+                    (actor, now, record_id),
+                )
+            self._touch_contract(conn, contract["id"], now)
+            self._audit(conn, contract["tender_id"], actor, "performance.reviewed",
+                        {"kind": kind, "record_id": record_id, "decision": decision, "note": note.strip()})
+            self._snapshot_contract(conn, contract["id"], actor, "performance.reviewed")
+            return dict(conn.execute("SELECT * FROM %s WHERE id=?" % table, (record_id,)).fetchone())
+
+    def _performance_view(self, conn: sqlite3.Connection, contract: dict[str, Any],
+                          actor: str, role: str) -> dict[str, Any]:
+        tender = conn.execute("SELECT id,tender_no,title FROM tenders WHERE id=?", (contract["tender_id"],)).fetchone()
+        milestones = [dict(r) for r in conn.execute(
+            "SELECT * FROM contract_milestones WHERE contract_id=? ORDER BY seq", (contract["id"],)).fetchall()]
+        current = next((m for m in milestones if m["status"] != "paid"), None)
+        view = {
+            "tender_id": tender["id"],
+            "tender_no": tender["tender_no"],
+            "tender_title": tender["title"],
+            "contract_id": contract["id"],
+            "contract_no": contract["contract_no"],
+            "contract_status": contract["status"],
+            "contract_version": contract["version"],
+            "current_milestone": ({"id": current["id"], "seq": current["seq"],
+                                   "name": current["name"], "status": current["status"]} if current else None),
+        }
+        full = role in {"procurement", "supervisor", "auditor"} or \
+            (role == "vendor" and self._is_contract_vendor(conn, contract, actor))
+        if not full:
+            view["milestones"] = [{"seq": m["seq"], "name": m["name"], "status": m["status"]} for m in milestones]
+            view["progress"] = {
+                "milestones": len(milestones),
+                "accepted": sum(1 for m in milestones if m["status"] in {"accepted", "paid"}),
+                "paid": sum(1 for m in milestones if m["status"] == "paid"),
+            }
+            return view
+        acceptances = [dict(r) for r in conn.execute(
+            "SELECT * FROM acceptances WHERE contract_id=? ORDER BY id", (contract["id"],)).fetchall()]
+        payments = [dict(r) for r in conn.execute(
+            "SELECT * FROM payments WHERE contract_id=? ORDER BY id", (contract["id"],)).fetchall()]
+        entries = []
+        todos = []
+        for milestone in milestones:
+            accepted = self._sum_amounts(
+                conn, "acceptances", "accepted_amount", "milestone_id=? AND status='effective'", (milestone["id"],))
+            paid = self._sum_amounts(
+                conn, "payments", "amount", "milestone_id=? AND status='effective'", (milestone["id"],))
+            entries.append({
+                "id": milestone["id"], "seq": milestone["seq"], "name": milestone["name"],
+                "status": milestone["status"], "amount": milestone["amount"],
+                "reported_quantity": milestone["reported_quantity"], "reported_by": milestone["reported_by"],
+                "reported_at": milestone["reported_at"], "accepted_amount": float(accepted),
+                "paid_amount": float(paid), "version": milestone["version"],
+            })
+            label = "节点%d %s" % (milestone["seq"], milestone["name"])
+            if milestone["status"] == "pending":
+                todos.append({"kind": "report", "milestone_id": milestone["id"], "text": "待供应商报量：" + label})
+            elif milestone["status"] == "reported":
+                if any(a["milestone_id"] == milestone["id"] and a["status"] == "pending_review" for a in acceptances):
+                    todos.append({"kind": "review", "milestone_id": milestone["id"], "text": "待复核验收：" + label})
+                else:
+                    todos.append({"kind": "accept", "milestone_id": milestone["id"], "text": "待采购人验收：" + label})
+            elif milestone["status"] == "accepted" and paid < accepted:
+                todos.append({"kind": "pay", "milestone_id": milestone["id"],
+                              "text": "待监督员付款：%s（剩余应付 %.2f）" % (label, accepted - paid)})
+        names = {m["id"]: (m["seq"], m["name"]) for m in milestones}
+        for payment in payments:
+            if payment["status"] == "pending_review":
+                seq, name = names.get(payment["milestone_id"], ("?", "?"))
+                todos.append({"kind": "review", "milestone_id": payment["milestone_id"],
+                              "text": "待复核付款：节点%s %s（付款#%d）" % (seq, name, payment["id"])})
+        accepted_total = self._sum_amounts(
+            conn, "acceptances", "accepted_amount", "contract_id=? AND status='effective'", (contract["id"],))
+        paid_total = self._sum_amounts(conn, "payments", "amount", "contract_id=? AND status='effective'", (contract["id"],))
+        versions = [dict(r) for r in conn.execute(
+            "SELECT id,version,reason,created_by,created_at FROM contract_versions WHERE contract_id=? ORDER BY version DESC",
+            (contract["id"],)).fetchall()]
+        view.update({
+            "total_amount": contract["total_amount"],
+            "milestones": entries,
+            "acceptances": acceptances,
+            "payments": payments,
+            "versions": versions,
+            "todos": todos,
+            "totals": {"accepted": float(accepted_total), "paid": float(paid_total),
+                       "remaining": float(Decimal(str(contract["total_amount"])) - paid_total)},
+        })
+        return view
+
+    def get_performance(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM contracts WHERE tender_id=?", (tender_id,)).fetchone()
+            if not row:
+                raise DomainError("该项目尚未建立合同", 404)
+            contract = dict(row)
+            if role == "vendor" and not self._is_contract_vendor(conn, contract, actor):
+                raise DomainError("无权查看该合同", 403)
+            return self._performance_view(conn, contract, actor, role)
+
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
         with self.connect() as conn:
             tender = dict(self._tender(conn, tender_id))
@@ -614,7 +1078,14 @@ class ProcurementService:
                 ).fetchall()]
             else:
                 bids, complaints = [], []
-        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline, "role": role}
+            performance = []
+            for row in conn.execute("SELECT * FROM contracts ORDER BY id DESC LIMIT 100").fetchall():
+                contract = dict(row)
+                if role == "vendor" and not self._is_contract_vendor(conn, contract, actor):
+                    continue
+                performance.append(self._performance_view(conn, contract, actor, role))
+        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline,
+                "performance": performance, "role": role}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -677,7 +1148,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
             elif path.startswith("/api/tenders/"):
-                self._send(200, self.service.get_tender(actor, role, int(path.split("/")[3])))
+                parts = path.split("/")
+                if len(parts) == 5 and parts[4] == "performance":
+                    self._send(200, self.service.get_performance(actor, role, int(parts[3])))
+                else:
+                    self._send(200, self.service.get_tender(actor, role, int(parts[3])))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
@@ -716,6 +1191,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.resolve_complaint(actor, role, **data)
             elif path == "/api/tenders/award":
                 result = self.service.award_tender(actor, role, **data)
+            elif path == "/api/contracts":
+                result = self.service.create_contract(actor, role, **data)
+            elif path == "/api/performance/report":
+                result = self.service.report_progress(actor, role, **data)
+            elif path == "/api/performance/accept":
+                result = self.service.accept_progress(actor, role, **data)
+            elif path == "/api/performance/pay":
+                result = self.service.register_payment(actor, role, **data)
+            elif path == "/api/performance/review":
+                result = self.service.review_record(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
