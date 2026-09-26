@@ -164,6 +164,93 @@ class ProcurementService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+
+                CREATE TABLE IF NOT EXISTS contracts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_no TEXT NOT NULL UNIQUE,
+                    tender_id INTEGER NOT NULL UNIQUE REFERENCES tenders(id),
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    title TEXT NOT NULL DEFAULT '',
+                    total_amount_cents INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS contract_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id),
+                    seq INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    amount_cents INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(contract_id,seq)
+                );
+                CREATE TABLE IF NOT EXISTS node_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id INTEGER NOT NULL REFERENCES contract_nodes(id),
+                    quantity REAL NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    submitted_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS node_acceptances (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id INTEGER NOT NULL REFERENCES contract_nodes(id),
+                    report_id INTEGER REFERENCES node_reports(id),
+                    amount_cents INTEGER NOT NULL,
+                    expected_amount_cents INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'accepted',
+                    note TEXT NOT NULL DEFAULT '',
+                    accepted_by TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    created_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    version INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_acceptance_active
+                    ON node_acceptances(node_id) WHERE status IN ('review','accepted');
+                CREATE TABLE IF NOT EXISTS contract_payables (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id),
+                    node_id INTEGER NOT NULL REFERENCES contract_nodes(id),
+                    acceptance_id INTEGER NOT NULL UNIQUE REFERENCES node_acceptances(id),
+                    amount_cents INTEGER NOT NULL,
+                    paid_cents INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'payable',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS contract_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id),
+                    payable_id INTEGER NOT NULL REFERENCES contract_payables(id),
+                    amount_cents INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'posted',
+                    note TEXT NOT NULL DEFAULT '',
+                    registered_by TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    created_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    version INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS entity_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_type TEXT NOT NULL,
+                    entity_id INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(entity_type,entity_id,version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_nodes_contract ON contract_nodes(contract_id,seq);
+                CREATE INDEX IF NOT EXISTS idx_payables_contract ON contract_payables(contract_id);
+                CREATE INDEX IF NOT EXISTS idx_payments_contract ON contract_payments(contract_id,status);
                 """
             )
 
@@ -556,6 +643,513 @@ class ProcurementService:
             self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
             return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
 
+    # ---- 履约验收 ----
+
+    @staticmethod
+    def money_to_cents(value: Any, field: str = "金额") -> int:
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, TypeError) as exc:
+            raise DomainError("%s必须是数值" % field) from exc
+        if not amount.is_finite() or amount <= 0:
+            raise DomainError("%s必须大于0" % field)
+        cents = (amount * 100).quantize(Decimal("1"))
+        if cents != amount * 100:
+            raise DomainError("%s最多两位小数" % field)
+        return int(cents)
+
+    @staticmethod
+    def yuan(cents: int) -> float:
+        return round(cents / 100, 2)
+
+    def _snapshot(self, conn: sqlite3.Connection, entity_type: str, entity_id: int,
+                  version: int, actor: str, snapshot: dict[str, Any]) -> None:
+        conn.execute(
+            "INSERT INTO entity_versions(entity_type,entity_id,version,snapshot,actor,created_at) VALUES(?,?,?,?,?,?)",
+            (entity_type, entity_id, version, json.dumps(snapshot, ensure_ascii=False, sort_keys=True, default=str), actor, utcnow()),
+        )
+
+    def _contract(self, conn: sqlite3.Connection, contract_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM contracts WHERE id=?", (contract_id,)).fetchone()
+        if not row:
+            raise DomainError("合同不存在", 404)
+        return row
+
+    @staticmethod
+    def _serialize_contract(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"], "contract_no": row["contract_no"], "tender_id": row["tender_id"],
+            "vendor_id": row["vendor_id"], "title": row["title"],
+            "total_amount": ProcurementService.yuan(row["total_amount_cents"]),
+            "status": row["status"], "version": row["version"],
+            "created_by": row["created_by"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _serialize_node(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"], "contract_id": row["contract_id"], "seq": row["seq"], "name": row["name"],
+            "amount": ProcurementService.yuan(row["amount_cents"]), "status": row["status"],
+            "version": row["version"], "accepted_amount": ProcurementService.yuan(row["accepted_cents"]),
+            "paid_amount": ProcurementService.yuan(row["paid_cents"]),
+        }
+
+    def create_contract(self, actor: str, role: str, tender_id: int, contract_no: str,
+                        nodes: list[dict[str, Any]], title: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "创建合同")
+        contract_no = contract_no.strip()
+        if not contract_no:
+            raise DomainError("合同编号不能为空")
+        if not isinstance(nodes, list) or not nodes:
+            raise DomainError("至少拆分一个履约节点")
+        prepared = []
+        total = 0
+        seen = set()
+        for index, item in enumerate(nodes, start=1):
+            if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+                raise DomainError("节点名称不能为空")
+            cents = self.money_to_cents(item.get("amount"), "节点金额")
+            seq = int(item.get("seq", index))
+            if seq in seen:
+                raise DomainError("节点序号不能重复")
+            seen.add(seq)
+            prepared.append({"seq": seq, "name": str(item["name"]).strip(), "amount_cents": cents})
+            total += cents
+        prepared.sort(key=lambda n: n["seq"])
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] != "awarded" or not tender["awarded_bid_id"]:
+                raise DomainError("只能从已授标项目创建合同", 409)
+            bid = conn.execute("SELECT * FROM bids WHERE id=?", (tender["awarded_bid_id"],)).fetchone()
+            if total != int(bid["price"] * 100 + 0.5):
+                raise DomainError("节点金额合计必须与中标金额一致（%s）" % self.yuan(int(bid["price"] * 100 + 0.5)))
+            try:
+                cur = conn.execute(
+                    """INSERT INTO contracts(contract_no,tender_id,vendor_id,title,total_amount_cents,created_by,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (contract_no, tender_id, bid["vendor_id"], title.strip() or tender["title"], total, actor, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("合同编号或授标项目合同已存在", 409) from exc
+            contract_id = cur.lastrowid
+            for node in prepared:
+                conn.execute(
+                    "INSERT INTO contract_nodes(contract_id,seq,name,amount_cents,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (contract_id, node["seq"], node["name"], node["amount_cents"], now, now),
+                )
+            self._audit(conn, tender_id, actor, "contract.created",
+                        {"contract_id": contract_id, "contract_no": contract_no, "nodes": len(prepared)})
+            result = self._load_contract(conn, contract_id, role, actor)
+            self._snapshot(conn, "contract", contract_id, 1, actor, result["contract"])
+            return result
+
+    def report_completion(self, actor: str, role: str, node_id: int, quantity: float,
+                          note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor"}, "报完成量")
+        try:
+            quantity = float(quantity)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("完成比例必须是数值") from exc
+        if quantity <= 0 or quantity > 100:
+            raise DomainError("完成比例必须在0到100之间")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            node = conn.execute("SELECT * FROM contract_nodes WHERE id=?", (node_id,)).fetchone()
+            if not node:
+                raise DomainError("履约节点不存在", 404)
+            contract = self._contract(conn, node["contract_id"])
+            if contract["status"] != "active":
+                raise DomainError("合同已结束，不能报送", 409)
+            if not self._actor_owns_contract(conn, contract, actor):
+                raise DomainError("只能为本单位中标的合同报送完成量", 403)
+            if node["status"] == "done":
+                raise DomainError("该节点已完成，不能重复报送", 409)
+            cur = conn.execute(
+                "INSERT INTO node_reports(node_id,quantity,note,submitted_by,created_at) VALUES(?,?,?,?,?)",
+                (node_id, quantity, note.strip(), actor, now),
+            )
+            conn.execute("UPDATE contract_nodes SET status='reported',version=version+1,updated_at=? WHERE id=?", (now, node_id))
+            self._audit(conn, contract["tender_id"], actor, "node.reported",
+                        {"node_id": node_id, "report_id": cur.lastrowid, "quantity": quantity})
+            new_node = conn.execute("SELECT * FROM contract_nodes WHERE id=?", (node_id,)).fetchone()
+            self._snapshot(conn, "node", node_id, new_node["version"], actor, self._node_view(conn, new_node))
+            return self._load_contract(conn, contract["id"], role, actor)
+
+    def accept_completion(self, actor: str, role: str, node_id: int, amount: float,
+                          report_id: int | None = None, note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"procurement"}, "履约验收")
+        cents = self.money_to_cents(amount, "验收金额")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            node = conn.execute("SELECT * FROM contract_nodes WHERE id=?", (node_id,)).fetchone()
+            if not node:
+                raise DomainError("履约节点不存在", 404)
+            contract = self._contract(conn, node["contract_id"])
+            if contract["status"] != "active":
+                raise DomainError("合同已结束，不能验收", 409)
+            if node["status"] not in {"reported", "partial"}:
+                raise DomainError("节点尚无完成量报送或已完成", 409)
+            report = None
+            if report_id is not None:
+                report = conn.execute("SELECT * FROM node_reports WHERE id=? AND node_id=?", (report_id, node_id)).fetchone()
+                if not report:
+                    raise DomainError("完成量报送不存在", 404)
+            else:
+                report = conn.execute(
+                    "SELECT * FROM node_reports WHERE node_id=? ORDER BY id DESC LIMIT 1", (node_id,)
+                ).fetchone()
+                if not report:
+                    raise DomainError("节点尚无完成量报送", 409)
+            # 同一节点只保留一条有效验收（部分唯一索引兜底，并发重复提交返回冲突）
+            if conn.execute(
+                "SELECT 1 FROM node_acceptances WHERE node_id=? AND status IN ('review','accepted')", (node_id,)
+            ).fetchone():
+                raise DomainError("该节点已有有效验收，重复提交冲突", 409)
+            accepted_before = conn.execute("SELECT COALESCE(SUM(amount_cents),0) AS c FROM node_acceptances WHERE node_id=? AND status='accepted'", (node_id,)).fetchone()["c"]
+            if accepted_before + cents > node["amount_cents"]:
+                raise DomainError("节点累计验收不能超过节点金额（剩余可验收 %s）" % self.yuan(node["amount_cents"] - accepted_before), 409)
+            contract_accepted = conn.execute(
+                "SELECT COALESCE(SUM(a.amount_cents),0) AS c FROM node_acceptances a JOIN contract_nodes n ON n.id=a.node_id WHERE n.contract_id=? AND a.status='accepted'",
+                (contract["id"],),
+            ).fetchone()["c"]
+            if contract_accepted + cents > contract["total_amount_cents"]:
+                raise DomainError("合同累计验收不能超过合同额", 409)
+            expected = int(node["amount_cents"] * Decimal(str(report["quantity"])) / 100)
+            # 金额不匹配：进入待复核，不形成应付
+            status = "accepted" if cents == expected else "review"
+            try:
+                cur = conn.execute(
+                    """INSERT INTO node_acceptances(node_id,report_id,amount_cents,expected_amount_cents,status,note,accepted_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (node_id, report["id"], cents, expected, status, note.strip(), actor, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该节点已有有效验收，重复提交冲突", 409) from exc
+            acceptance_id = cur.lastrowid
+            if status == "accepted":
+                self._post_acceptance(conn, node, contract, acceptance_id, cents, now)
+            self._audit(conn, contract["tender_id"], actor, "node.accepted",
+                        {"node_id": node_id, "acceptance_id": acceptance_id,
+                         "amount": self.yuan(cents), "expected": self.yuan(expected), "status": status})
+            self._snapshot(conn, "acceptance", acceptance_id, 1, actor,
+                           dict(conn.execute("SELECT * FROM node_acceptances WHERE id=?", (acceptance_id,)).fetchone()))
+            return self._load_contract(conn, contract["id"], role, actor)
+
+    def _post_acceptance(self, conn: sqlite3.Connection, node: sqlite3.Row, contract: sqlite3.Row,
+                         acceptance_id: int, cents: int, now: str) -> None:
+        conn.execute(
+            """INSERT INTO contract_payables(contract_id,node_id,acceptance_id,amount_cents,created_at,updated_at)
+               VALUES(?,?,?,?,?,?)""",
+            (contract["id"], node["id"], acceptance_id, cents, now, now),
+        )
+        node_status = "partial"
+        accepted_total = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) AS c FROM node_acceptances WHERE node_id=? AND status='accepted'", (node["id"],)
+        ).fetchone()["c"]
+        if accepted_total >= node["amount_cents"]:
+            node_status = "done"
+        conn.execute("UPDATE contract_nodes SET status=?,version=version+1,updated_at=? WHERE id=?", (node_status, now, node["id"]))
+        new_node = conn.execute("SELECT * FROM contract_nodes WHERE id=?", (node["id"],)).fetchone()
+        self._snapshot(conn, "node", node["id"], new_node["version"], "system", self._node_view(conn, new_node))
+
+    def resolve_acceptance(self, actor: str, role: str, acceptance_id: int,
+                           decision: str, amount: float | None = None, note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "复核验收")
+        if decision not in {"approve", "reject"}:
+            raise DomainError("复核决定只支持 approve 或 reject")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM node_acceptances WHERE id=?", (acceptance_id,)).fetchone()
+            if not row:
+                raise DomainError("验收记录不存在", 404)
+            if row["status"] != "review":
+                raise DomainError("该验收不在待复核状态", 409)
+            node = conn.execute("SELECT * FROM contract_nodes WHERE id=?", (row["node_id"],)).fetchone()
+            contract = self._contract(conn, node["contract_id"])
+            if decision == "reject":
+                conn.execute(
+                    "UPDATE node_acceptances SET status='rejected',reviewed_by=?,reviewed_at=?,note=?,version=version+1 WHERE id=?",
+                    (actor, now, (note.strip() or row["note"]), acceptance_id),
+                )
+                self._audit(conn, contract["tender_id"], actor, "acceptance.rejected", {"acceptance_id": acceptance_id})
+            else:
+                cents = self.money_to_cents(amount, "确认金额") if amount is not None else row["amount_cents"]
+                accepted_before = conn.execute(
+                    "SELECT COALESCE(SUM(amount_cents),0) AS c FROM node_acceptances WHERE node_id=? AND status='accepted'", (node["id"],)
+                ).fetchone()["c"]
+                if accepted_before + cents > node["amount_cents"]:
+                    raise DomainError("确认金额超过节点剩余可验收金额", 409)
+                contract_accepted = conn.execute(
+                    "SELECT COALESCE(SUM(a.amount_cents),0) AS c FROM node_acceptances a JOIN contract_nodes n ON n.id=a.node_id WHERE n.contract_id=? AND a.status='accepted'",
+                    (contract["id"],),
+                ).fetchone()["c"]
+                if contract_accepted + cents > contract["total_amount_cents"]:
+                    raise DomainError("确认后合同累计验收超过合同额", 409)
+                conn.execute(
+                    "UPDATE node_acceptances SET status='accepted',amount_cents=?,reviewed_by=?,reviewed_at=?,note=?,version=version+1 WHERE id=?",
+                    (cents, actor, now, (note.strip() or row["note"]), acceptance_id),
+                )
+                self._post_acceptance(conn, node, contract, acceptance_id, cents, now)
+                self._audit(conn, contract["tender_id"], actor, "acceptance.approved",
+                            {"acceptance_id": acceptance_id, "amount": self.yuan(cents)})
+            updated = conn.execute("SELECT * FROM node_acceptances WHERE id=?", (acceptance_id,)).fetchone()
+            self._snapshot(conn, "acceptance", acceptance_id, updated["version"], actor, dict(updated))
+            return self._load_contract(conn, contract["id"], role, actor)
+
+    def register_payment(self, actor: str, role: str, payable_id: int, amount: float,
+                         note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "登记付款")
+        cents = self.money_to_cents(amount, "付款金额")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            payable = conn.execute("SELECT * FROM contract_payables WHERE id=?", (payable_id,)).fetchone()
+            if not payable:
+                raise DomainError("应付记录不存在", 404)
+            if payable["status"] == "paid":
+                raise DomainError("该应付记录已结清", 409)
+            node = conn.execute("SELECT * FROM contract_nodes WHERE id=?", (payable["node_id"],)).fetchone()
+            contract = self._contract(conn, payable["contract_id"])
+            remaining_payable = payable["amount_cents"] - payable["paid_cents"]
+            contract_paid = conn.execute(
+                "SELECT COALESCE(SUM(CASE WHEN status='posted' THEN amount_cents ELSE 0 END),0) AS c FROM contract_payments WHERE contract_id=?",
+                (contract["id"],),
+            ).fetchone()["c"]
+            node_paid = conn.execute(
+                "SELECT COALESCE(SUM(CASE WHEN status='posted' THEN amount_cents ELSE 0 END),0) AS c FROM contract_payments WHERE contract_id=? AND payable_id IN (SELECT id FROM contract_payables WHERE node_id=?)",
+                (contract["id"], node["id"]),
+            ).fetchone()["c"]
+            node_accepted = conn.execute(
+                "SELECT COALESCE(SUM(amount_cents),0) AS c FROM node_acceptances WHERE node_id=? AND status='accepted'", (node["id"],)
+            ).fetchone()["c"]
+            # 节点超付 / 超过合同额：停在待复核，付款不生效
+            over = cents > remaining_payable or node_paid + cents > node_accepted or contract_paid + cents > contract["total_amount_cents"]
+            status = "review" if over else "posted"
+            cur = conn.execute(
+                """INSERT INTO contract_payments(contract_id,payable_id,amount_cents,status,note,registered_by,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (contract["id"], payable_id, cents, status, note.strip(), actor, now),
+            )
+            payment_id = cur.lastrowid
+            if status == "posted":
+                self._apply_payment(conn, payable, cents, now)
+            self._audit(conn, contract["tender_id"], actor, "payment.registered",
+                        {"payable_id": payable_id, "payment_id": payment_id,
+                         "amount": self.yuan(cents), "status": status})
+            result = self._load_contract(conn, contract["id"], role, actor)
+            self._snapshot(conn, "payment", payment_id, 1, actor,
+                           dict(conn.execute("SELECT * FROM contract_payments WHERE id=?", (payment_id,)).fetchone()))
+            return result
+
+    def _apply_payment(self, conn: sqlite3.Connection, payable: sqlite3.Row, cents: int, now: str) -> None:
+        new_paid = payable["paid_cents"] + cents
+        payable_status = "paid" if new_paid >= payable["amount_cents"] else "partial"
+        conn.execute("UPDATE contract_payables SET paid_cents=?,status=?,updated_at=? WHERE id=?",
+                     (new_paid, payable_status, now, payable["id"]))
+        contract_id = payable["contract_id"]
+        pending_payables = conn.execute(
+            "SELECT COUNT(*) AS c FROM contract_payables WHERE contract_id=? AND status!='paid'", (contract_id,)
+        ).fetchone()["c"]
+        unfinished_nodes = conn.execute(
+            "SELECT COUNT(*) AS c FROM contract_nodes WHERE contract_id=? AND status!='done'", (contract_id,)
+        ).fetchone()["c"]
+        if not pending_payables and not unfinished_nodes:
+            conn.execute("UPDATE contracts SET status='completed',version=version+1,updated_at=? WHERE id=?", (now, contract_id))
+            contract = conn.execute("SELECT * FROM contracts WHERE id=?", (contract_id,)).fetchone()
+            self._snapshot(conn, "contract", contract_id, contract["version"], "system", self._serialize_contract(contract))
+
+    def resolve_payment(self, actor: str, role: str, payment_id: int,
+                        decision: str, amount: float | None = None, note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "复核付款")
+        if decision not in {"approve", "reject"}:
+            raise DomainError("复核决定只支持 approve 或 reject")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            payment = conn.execute("SELECT * FROM contract_payments WHERE id=?", (payment_id,)).fetchone()
+            if not payment:
+                raise DomainError("付款记录不存在", 404)
+            if payment["status"] != "review":
+                raise DomainError("该付款不在待复核状态", 409)
+            contract = self._contract(conn, payment["contract_id"])
+            if decision == "reject":
+                conn.execute(
+                    "UPDATE contract_payments SET status='rejected',reviewed_by=?,reviewed_at=?,note=?,version=version+1 WHERE id=?",
+                    (actor, now, (note.strip() or payment["note"]), payment_id),
+                )
+                self._audit(conn, contract["tender_id"], actor, "payment.rejected", {"payment_id": payment_id})
+            else:
+                cents = self.money_to_cents(amount, "确认金额") if amount is not None else payment["amount_cents"]
+                payable = conn.execute("SELECT * FROM contract_payables WHERE id=?", (payment["payable_id"],)).fetchone()
+                remaining_payable = payable["amount_cents"] - payable["paid_cents"]
+                contract_paid = conn.execute(
+                    "SELECT COALESCE(SUM(CASE WHEN status='posted' THEN amount_cents ELSE 0 END),0) AS c FROM contract_payments WHERE contract_id=?",
+                    (contract["id"],),
+                ).fetchone()["c"]
+                if cents > remaining_payable or contract_paid + cents > contract["total_amount_cents"]:
+                    raise DomainError("确认金额仍超出可付额度，不能通过复核", 409)
+                conn.execute(
+                    "UPDATE contract_payments SET status='posted',amount_cents=?,reviewed_by=?,reviewed_at=?,note=?,version=version+1 WHERE id=?",
+                    (cents, actor, now, (note.strip() or payment["note"]), payment_id),
+                )
+                self._apply_payment(conn, payable, cents, now)
+                self._audit(conn, contract["tender_id"], actor, "payment.approved",
+                            {"payment_id": payment_id, "amount": self.yuan(cents)})
+            updated = conn.execute("SELECT * FROM contract_payments WHERE id=?", (payment_id,)).fetchone()
+            self._snapshot(conn, "payment", payment_id, updated["version"], actor, dict(updated))
+            return self._load_contract(conn, contract["id"], role, actor)
+
+    def _node_view(self, conn: sqlite3.Connection, node: sqlite3.Row) -> dict[str, Any]:
+        accepted_cents = conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN status='accepted' THEN amount_cents ELSE 0 END),0) AS c FROM node_acceptances WHERE node_id=?",
+            (node["id"],),
+        ).fetchone()["c"]
+        paid_cents = conn.execute(
+            """SELECT COALESCE(SUM(CASE WHEN p.status='posted' THEN p.amount_cents ELSE 0 END),0) AS c
+               FROM contract_payments p JOIN contract_payables py ON py.id=p.payable_id WHERE py.node_id=?""",
+            (node["id"],),
+        ).fetchone()["c"]
+        data = dict(node)
+        return {
+            "id": data["id"], "contract_id": data["contract_id"], "seq": data["seq"], "name": data["name"],
+            "amount": self.yuan(data["amount_cents"]), "status": data["status"], "version": data["version"],
+            "accepted_amount": self.yuan(accepted_cents), "paid_amount": self.yuan(paid_cents),
+        }
+
+    def _load_contract(self, conn: sqlite3.Connection, contract_id: int, role: str, actor: str) -> dict[str, Any]:
+        row = self._contract(conn, contract_id)
+        contract = self._serialize_contract(row)
+        node_rows = conn.execute("SELECT * FROM contract_nodes WHERE contract_id=? ORDER BY seq", (contract_id,)).fetchall()
+        nodes = [self._node_view(conn, n) for n in node_rows]
+        reports = [dict(r) for r in conn.execute(
+            "SELECT id,node_id,quantity,note,submitted_by,created_at FROM node_reports WHERE node_id IN (SELECT id FROM contract_nodes WHERE contract_id=?) ORDER BY id",
+            (contract_id,),
+        ).fetchall()]
+        acceptances = []
+        for r in conn.execute(
+            """SELECT a.* FROM node_acceptances a JOIN contract_nodes n ON n.id=a.node_id
+               WHERE n.contract_id=? ORDER BY a.id""",
+            (contract_id,),
+        ).fetchall():
+            item = dict(r)
+            item["amount"] = self.yuan(item.pop("amount_cents"))
+            item["expected_amount"] = self.yuan(item.pop("expected_amount_cents"))
+            acceptances.append(item)
+        payables, payments = [], []
+        for r in conn.execute("SELECT * FROM contract_payables WHERE contract_id=? ORDER BY id", (contract_id,)).fetchall():
+            item = dict(r)
+            item["amount"] = self.yuan(item.pop("amount_cents"))
+            item["paid"] = self.yuan(item.pop("paid_cents"))
+            payables.append(item)
+        for r in conn.execute("SELECT * FROM contract_payments WHERE contract_id=? ORDER BY id", (contract_id,)).fetchall():
+            item = dict(r)
+            item["amount"] = self.yuan(item.pop("amount_cents"))
+            payments.append(item)
+        accepted_total = self.yuan(sum(int(round(n["accepted_amount"] * 100)) for n in nodes))
+        paid_total = self.yuan(sum(int(round(n["paid_amount"] * 100)) for n in nodes))
+        # 公开视图：只看履约状态，不暴露金额明细
+        if role == "public" or (role == "vendor" and not self._actor_owns_contract(conn, row, actor)):
+            public_nodes = [{"id": n["id"], "seq": n["seq"], "name": n["name"], "status": n["status"]} for n in nodes]
+            public_acceptances = [{"id": a["id"], "node_id": a["node_id"], "status": a["status"], "created_at": a["created_at"]} for a in acceptances]
+            return {
+                "contract": {"id": contract["id"], "contract_no": contract["contract_no"], "tender_id": contract["tender_id"],
+                             "vendor_id": contract["vendor_id"], "title": contract["title"], "status": contract["status"]},
+                "nodes": public_nodes, "acceptances": public_acceptances,
+                "payables": [], "payments": [], "reports": [],
+            }
+        if role == "vendor":
+            reports = [r for r in reports if r["submitted_by"] == actor]
+        return {
+            "contract": contract, "nodes": nodes, "reports": reports,
+            "acceptances": acceptances, "payables": payables, "payments": payments,
+            "accepted_total": accepted_total, "paid_total": paid_total,
+        }
+
+    @staticmethod
+    def _actor_owns_contract(conn: sqlite3.Connection, contract: sqlite3.Row, actor: str) -> bool:
+        row = conn.execute(
+            """SELECT 1 FROM bids b WHERE b.id=(SELECT awarded_bid_id FROM tenders WHERE id=?)
+               AND b.vendor_id=? AND EXISTS (SELECT 1 FROM bids x WHERE x.id=b.id AND x.submitted_by=?)""",
+            (contract["tender_id"], contract["vendor_id"], actor),
+        ).fetchone()
+        return row is not None
+
+    def get_contract(self, actor: str, role: str, contract_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = self._contract(conn, contract_id)
+            if role == "vendor" and not self._actor_owns_contract(conn, row, actor):
+                raise DomainError("合同不存在", 404)
+            return self._load_contract(conn, contract_id, role, actor)
+
+    def contract_overview(self, actor: str, role: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            contracts = [self._load_contract(conn, r["id"], role, actor)["contract"]
+                         for r in conn.execute("SELECT id FROM contracts ORDER BY id DESC").fetchall()]
+            todos = self._todos(conn, role, actor)
+        return {"contracts": contracts, "todos": todos, "role": role}
+
+    def _todos(self, conn: sqlite3.Connection, role: str, actor: str) -> list[dict[str, Any]]:
+        todos: list[dict[str, Any]] = []
+        if role == "supervisor":
+            for r in conn.execute(
+                """SELECT a.id,a.node_id,n.contract_id,a.amount_cents,a.expected_amount_cents FROM node_acceptances a
+                   JOIN contract_nodes n ON n.id=a.node_id WHERE a.status='review' ORDER BY a.id"""
+            ).fetchall():
+                todos.append({"type": "acceptance_review", "acceptance_id": r["id"], "node_id": r["node_id"],
+                              "contract_id": r["contract_id"], "amount": self.yuan(r["amount_cents"]),
+                              "expected_amount": self.yuan(r["expected_amount_cents"])})
+            for r in conn.execute(
+                """SELECT p.id,p.payable_id,p.contract_id,p.amount_cents FROM contract_payments p WHERE p.status='review' ORDER BY p.id"""
+            ).fetchall():
+                todos.append({"type": "payment_review", "payment_id": r["id"], "payable_id": r["payable_id"],
+                              "contract_id": r["contract_id"], "amount": self.yuan(r["amount_cents"])})
+        elif role == "procurement":
+            for r in conn.execute(
+                """SELECT n.id,n.contract_id,n.seq,n.name FROM contract_nodes n JOIN contracts c ON c.id=n.contract_id
+                   WHERE n.status='reported' AND c.status='active'
+                   AND NOT EXISTS (SELECT 1 FROM node_acceptances a WHERE a.node_id=n.id AND a.status IN ('review','accepted'))
+                   ORDER BY n.id"""
+            ).fetchall():
+                todos.append({"type": "acceptance_pending", "node_id": r["id"], "contract_id": r["contract_id"],
+                              "seq": r["seq"], "name": r["name"]})
+        elif role == "vendor":
+            for r in conn.execute(
+                """SELECT n.id,n.contract_id,n.seq,n.name FROM contract_nodes n JOIN contracts c ON c.id=n.contract_id
+                   JOIN tenders t ON t.id=c.tender_id JOIN bids b ON b.id=t.awarded_bid_id
+                   WHERE b.submitted_by=? AND n.status='pending' AND c.status='active' ORDER BY n.seq""",
+                (actor,),
+            ).fetchall():
+                todos.append({"type": "report_pending", "node_id": r["id"], "contract_id": r["contract_id"],
+                              "seq": r["seq"], "name": r["name"]})
+        return todos
+
+    def list_versions(self, actor: str, role: str, entity_type: str, entity_id: int) -> dict[str, Any]:
+        require_role(role, {"supervisor", "auditor", "procurement"}, "查看版本历史")
+        if entity_type not in {"contract", "node", "acceptance", "payment"}:
+            raise DomainError("版本对象类型无效")
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id,entity_type,entity_id,version,actor,created_at,snapshot FROM entity_versions WHERE entity_type=? AND entity_id=? ORDER BY version",
+                (entity_type, entity_id),
+            ).fetchall()
+            items = []
+            for r in rows:
+                item = dict(r)
+                item["snapshot"] = json.loads(item["snapshot"])
+                items.append(item)
+        return {"entity_type": entity_type, "entity_id": entity_id, "versions": items}
+
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
         with self.connect() as conn:
             tender = dict(self._tender(conn, tender_id))
@@ -614,7 +1208,9 @@ class ProcurementService:
                 ).fetchall()]
             else:
                 bids, complaints = [], []
-        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline, "role": role}
+            overview = self.contract_overview(actor, role)
+        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline,
+                "role": role, "performance": overview}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -671,11 +1267,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path in {"/performance", "/performance.html"}:
+                body = (ROOT / "static" / "performance.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             actor, role = self._headers()
             if path == "/health":
                 self._send(200, {"status": "ok", "service": "public-procurement"})
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
+            elif path == "/api/contracts/overview":
+                self._send(200, self.service.contract_overview(actor, role))
+            elif path.startswith("/api/contracts/"):
+                self._send(200, self.service.get_contract(actor, role, int(path.split("/")[3])))
+            elif path.startswith("/api/versions/"):
+                parts = path.split("/")
+                self._send(200, self.service.list_versions(actor, role, parts[3], int(parts[4])))
             elif path.startswith("/api/tenders/"):
                 self._send(200, self.service.get_tender(actor, role, int(path.split("/")[3])))
             else:
@@ -716,6 +1327,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.resolve_complaint(actor, role, **data)
             elif path == "/api/tenders/award":
                 result = self.service.award_tender(actor, role, **data)
+            elif path == "/api/contracts":
+                result = self.service.create_contract(actor, role, **data)
+            elif path == "/api/performance/reports":
+                result = self.service.report_completion(actor, role, **data)
+            elif path == "/api/performance/acceptances":
+                result = self.service.accept_completion(actor, role, **data)
+            elif path == "/api/performance/acceptances/resolve":
+                result = self.service.resolve_acceptance(actor, role, **data)
+            elif path == "/api/performance/payments":
+                result = self.service.register_payment(actor, role, **data)
+            elif path == "/api/performance/payments/resolve":
+                result = self.service.resolve_payment(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)

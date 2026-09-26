@@ -1,0 +1,172 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>合同履约验收台</title>
+<style>
+body{font:14px/1.6 system-ui,sans-serif;max-width:1200px;margin:24px auto;padding:0 18px;color:#24303a}
+h1{font-size:22px}h2{font-size:17px;margin:22px 0 8px}
+table{border-collapse:collapse;width:100%;margin:10px 0}th,td{border:1px solid #d4dce2;padding:6px 8px;font-size:13px}
+th{background:#eef4f7;text-align:left}
+.bar{background:#eef8f3;border-left:5px solid #23845b;padding:10px 14px;margin-bottom:14px}
+.card{border:1px solid #d4dce2;border-radius:6px;padding:12px 14px;margin:10px 0}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:6px 0}
+input,select,button{font:inherit;padding:4px 8px}
+button{cursor:pointer;border:1px solid #8fa4b1;border-radius:4px;background:#f4f8fa}
+button.primary{background:#23845b;color:#fff;border-color:#23845b}
+button.warn{background:#b7791f;color:#fff;border-color:#b7791f}
+button.danger{background:#a1443c;color:#fff;border-color:#a1443c}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;background:#e7edf1}
+.tag.review{background:#fdf0d5;color:#8a5a00}.tag.done,.tag.posted,.tag.accepted{background:#e2f2ea;color:#1d6b48}
+.tag.rejected{background:#f7e4e2;color:#8f322a}.tag.reported{background:#e4eef8;color:#24507a}
+.muted{color:#78858f;font-size:12px}.hidden{display:none}
+.noderow input{width:90px}.noderow .nm{width:220px}
+#msg{min-height:20px;color:#a1443c;font-size:13px}
+</style>
+<h1>合同履约验收台</h1>
+<div class="bar">监督员从已授标项目建合同并拆分节点金额；供应商报完成量，采购人验收形成应付，监督员登记付款。累计验收/付款不得超过合同额，超付或金额不匹配进入待复核。公开页只展示履约状态。</div>
+<div class="row">
+  <label>身份 <select id="role">
+    <option value="public">公开访客</option><option value="vendor">供应商</option>
+    <option value="procurement">采购人</option><option value="supervisor">监督员</option>
+    <option value="auditor">审计员</option>
+  </select></label>
+  <label>操作人 <input id="user" value="vendor-demo" size="14"></label>
+  <button onclick="loadAll()">刷新</button>
+  <a href="/">返回投标页</a><span id="msg"></span>
+</div>
+
+<h2>待办</h2><div id="todos"><div class="muted">加载中…</div></div>
+
+<div id="createBox" class="hidden"><h2>从已授标项目建合同</h2><div id="awarded"></div></div>
+
+<h2>合同（按项目显示当前节点）</h2><div id="contracts"><div class="muted">加载中…</div></div>
+<div id="detail"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+function h(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function api(path,opts={}){
+  const res=await fetch(path,{headers:{'Content-Type':'application/json','X-User':$('#user').value,'X-Role':$('#role').value},...opts});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok){$('#msg').textContent='✗ '+data.error;throw new Error(data.error);}
+  $('#msg').textContent='';return data;
+}
+const tag=s=>`<span class="tag ${h(s)}">${({pending':'待开始',reported:'已报量',partial:'部分完成',done:'已完成',review:'待复核',accepted:'已验收',rejected:'已驳回',payable:'待付款',paid:'已结清',posted:'已登记',active:'履行中',completed:'已完成'}[s]||s)}</span>`;
+
+async function loadAll(){
+  const role=$('#role').value;
+  $('#createBox').classList.toggle('hidden',role!=='supervisor');
+  const [state,overview]=await Promise.all([api('/api/state'),api('/api/contracts/overview')]);
+  renderTodos(overview.todos);
+  renderAwarded(state.tenders.filter(t=>t.status==='awarded'));
+  renderContracts(overview.contracts,role);
+  $('#detail').innerHTML='';
+}
+
+function renderTodos(todos){
+  if(!todos.length){$('#todos').innerHTML='<div class="muted">暂无待办</div>';return;}
+  $('#todos').innerHTML='<table><thead><tr><th>类型</th><th>对象</th><th>合同</th>'+
+    (todos.some(t=>t.amount!=null)?'<th>金额</th>':'')+'<th>操作</th></tr></thead><tbody>'+
+    todos.map(t=>{
+      const target=t.type==='acceptance_review'?`验收 #${t.acceptance_id}（节点 ${t.node_id}，申报 ${t.amount}，匹配 ${t.expected_amount}）`
+        :t.type==='payment_review'?`付款 #${t.payment_id}（应付 ${t.payable_id}，金额 ${t.amount}）`
+        :t.type==='acceptance_pending'?`节点 ${t.seq} ${h(t.name)} 待验收`
+        :`节点 ${t.seq} ${h(t.name)} 待报完成量`;
+      let act='';
+      if(t.type==='acceptance_review')act=`<button class="primary" onclick="resolveAcceptance(${t.acceptance_id},'approve')">复核通过</button> <button class="danger" onclick="resolveAcceptance(${t.acceptance_id},'reject')">驳回</button>`;
+      if(t.type==='payment_review')act=`<button class="primary" onclick="resolvePayment(${t.payment_id},'approve')">复核通过</button> <button class="danger" onclick="resolvePayment(${t.payment_id},'reject')">驳回</button>`;
+      if(t.type==='acceptance_pending')act=`<button onclick="openContract(${t.contract_id})">去验收</button>`;
+      if(t.type==='report_pending')act=`<button onclick="openContract(${t.contract_id})">去报量</button>`;
+      return `<tr><td>${({acceptance_review:'验收复核',payment_review:'付款复核',acceptance_pending:'待验收',report_pending:'待报量'}[t.type])}</td><td>${target}</td><td>#${t.contract_id}</td>${t.amount!=null?`<td>${t.amount}</td>`:''}<td>${act}</td></tr>`;
+    }).join('')+'</tbody></table>';
+}
+
+let awardedCache=[];
+function renderAwarded(tenders){
+  awardedCache=tenders;
+  if(!tenders.length){$('#awarded').innerHTML='<div class="muted">暂无已授标项目</div>';return;}
+  $('#awarded').innerHTML=tenders.map(t=>`
+    <div class="card">项目 #${t.id} ${h(t.tender_no)} ${h(t.title)}
+      <div class="row">合同编号 <input id="cno_${t.id}" value="C-${h(t.tender_no)}" size="16">
+        <button class="primary" onclick="addNodeRow(${t.id})">加节点</button>
+        <button onclick="createContract(${t.id})">建合同</button></div>
+      <div id="nodes_${t.id}"></div>
+      <div class="muted">节点金额合计须等于中标金额</div>
+    </div>`).join('');
+  tenders.forEach(t=>{addNodeRow(t.id);addNodeRow(t.id);});
+}
+function addNodeRow(tenderId){
+  const box=$('#nodes_'+tenderId);const i=box.children.length+1;
+  const d=document.createElement('div');d.className='row noderow';
+  d.innerHTML=`序号 <input class="seq" value="${i}" size="3"> 名称 <input class="nm" placeholder="节点名称"> 金额 <input class="amt" placeholder="元"> <button class="danger" onclick="this.parentElement.remove()">删</button>`;
+  box.appendChild(d);
+}
+async function createContract(tenderId){
+  const box=$('#nodes_'+tenderId);
+  const nodes=[...box.querySelectorAll('.noderow')].map(r=>({seq:Number(r.querySelector('.seq').value),name:r.querySelector('.nm').value,amount:Number(r.querySelector('.amt').value)}));
+  await api('/api/contracts',{method:'POST',body:JSON.stringify({tender_id:tenderId,contract_no:$('#cno_'+tenderId).value,nodes})});
+  loadAll();
+}
+
+function renderContracts(contracts,role){
+  if(!contracts.length){$('#contracts').innerHTML='<div class="muted">暂无合同</div>';return;}
+  const pub=role==='public';
+  $('#contracts').innerHTML='<table><thead><tr><th>合同</th><th>项目</th><th>供应商</th><th>标题</th>'+
+    (pub?'':'<th>合同额</th>')+'<th>状态</th><th></th></tr></thead><tbody>'+
+    contracts.map(c=>`<tr><td>${h(c.contract_no)}</td><td>#${c.tender_id}</td><td>#${c.vendor_id}</td><td>${h(c.title)}</td>${pub?'':`<td>${c.total_amount}</td>`}<td>${tag(c.status)}</td><td><button onclick="openContract(${c.id})">查看</button></td></tr>`).join('')+'</tbody></table>';
+}
+
+async function openContract(id){
+  const role=$('#role').value,d=await api('/api/contracts/'+id);
+  const pub=role==='public';
+  let html=`<h2>合同 ${h(d.contract.contract_no)} ${tag(d.contract.status)}</h2>`;
+  if(!pub)html+=`<div class="muted">合同额 ${d.contract.total_amount}｜累计验收 ${d.accepted_total}｜累计付款 ${d.paid_total}</div>`;
+  html+='<table><thead><tr><th>序</th><th>节点</th>'+(pub?'':'<th>金额</th><th>已验收</th><th>已付</th>')+'<th>状态</th><th>操作</th></tr></thead><tbody>'+
+    d.nodes.map(n=>{
+      let act='';
+      if(role==='vendor'&&['pending'].includes(n.status))act=`<button onclick="reportForm(${n.id})">报完成量</button>`;
+      if(role==='vendor'&&n.status==='reported')act='<span class="muted">待采购人验收</span>';
+      if(role==='procurement'&&n.status==='reported')act=`<button class="primary" onclick="acceptForm(${n.id},${n.amount})">验收</button>`;
+      if(role==='procurement'&&n.status==='partial')act=`<button class="primary" onclick="acceptForm(${n.id},${n.amount})">继续验收</button>`;
+      return `<tr><td>${n.seq}</td><td>${h(n.name)}</td>${pub?'':`<td>${n.amount}</td><td>${n.accepted_amount}</td><td>${n.paid_amount}</td>`}<td>${tag(n.status)}</td><td>${act}</td></tr>`;
+    }).join('')+'</tbody></table>';
+
+  if(!pub&&d.acceptances.length){
+    html+='<h2>验收记录（同一节点只保留一条有效验收）</h2><table><thead><tr><th>#</th><th>节点</th><th>验收金额</th><th>报送匹配额</th><th>状态</th><th>验收人</th><th>时间</th></tr></thead><tbody>'+
+      d.acceptances.map(a=>`<tr><td>${a.id}</td><td>${a.node_id}</td><td>${a.amount}</td><td>${a.expected_amount}</td><td>${tag(a.status)}</td><td>${h(a.accepted_by)}</td><td class="muted">${a.created_at}</td></tr>`).join('')+'</tbody></table>';
+  }
+  if(!pub&&d.payables.length){
+    html+='<h2>应付 / 付款</h2><table><thead><tr><th>应付#</th><th>节点</th><th>金额</th><th>已付</th><th>状态</th><th>操作</th></tr></thead><tbody>'+
+      d.payables.map(p=>`<tr><td>${p.id}</td><td>${p.node_id}</td><td>${p.amount}</td><td>${p.paid}</td><td>${tag(p.status)}</td><td>${role==='supervisor'&&p.status!=='paid'?`<button class="primary" onclick="payForm(${p.id})">登记付款</button>`:''}</td></tr>`).join('')+'</tbody></table>';
+    if(d.payments.length)html+='<table><thead><tr><th>付款#</th><th>应付</th><th>金额</th><th>状态</th><th>登记人</th><th>时间</th></tr></thead><tbody>'+
+      d.payments.map(p=>`<tr><td>${p.id}</td><td>${p.payable_id}</td><td>${p.amount}</td><td>${tag(p.status)}</td><td>${h(p.registered_by)}</td><td class="muted">${p.created_at}</td></tr>`).join('')+'</tbody></table>';
+  }
+  $('#detail').innerHTML=html;$('#detail').scrollIntoView({behavior:'smooth'});
+  window._detail=d;
+}
+
+function reportForm(nodeId){
+  const q=prompt('完成量百分比（0-100）','100');if(q===null)return;
+  const note=prompt('备注（可空）','')||'';
+  api('/api/performance/reports',{method:'POST',body:JSON.stringify({node_id:nodeId,quantity:Number(q),note})}).then(()=>{const id=window._detail.contract.id;loadAll().then(()=>openContract(id));});
+}
+function acceptForm(nodeId,nodeAmount){
+  const amt=prompt('验收金额（元），与报量匹配额不一致将进入待复核',String(nodeAmount));if(amt===null)return;
+  const note=prompt('备注（可空）','')||'';
+  api('/api/performance/acceptances',{method:'POST',body:JSON.stringify({node_id:nodeId,amount:Number(amt),note})}).then(()=>{const id=window._detail.contract.id;loadAll().then(()=>openContract(id));});
+}
+function payForm(payableId){
+  const amt=prompt('付款金额（元），超过节点已验收或合同额将进入待复核','');if(amt===null)return;
+  const note=prompt('备注（可空）','')||'';
+  api('/api/performance/payments',{method:'POST',body:JSON.stringify({payable_id:payableId,amount:Number(amt),note})}).then(()=>{const id=window._detail.contract.id;loadAll().then(()=>openContract(id));});
+}
+async function resolveAcceptance(id,decision){
+  let body={acceptance_id:id,decision};
+  if(decision==='approve'){const amt=prompt('复核通过可修正金额（留空按原金额）','');if(amt===null)return;if(amt)body.amount=Number(amt);}
+  await api('/api/performance/acceptances/resolve',{method:'POST',body:JSON.stringify(body)});loadAll();
+}
+async function resolvePayment(id,decision){
+  let body={payment_id:id,decision};
+  if(decision==='approve'){const amt=prompt('复核通过可修正金额（留空按原金额）','');if(amt===null)return;if(amt)body.amount=Number(amt);}
+  await api('/api/performance/payments/resolve',{method:'POST',body:JSON.stringify(body)});loadAll();
+}
+$('#role').addEventListener('change',loadAll);
+loadAll();
+</script>
